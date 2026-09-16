@@ -1,0 +1,145 @@
+name: Verified commit lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      method:
+        description: Commit method to test
+        required: true
+        type: choice
+        options:
+          - unsigned-local-git
+          - github-signed-graphql
+
+permissions:
+  contents: write
+
+concurrency:
+  group: verified-commit-lab
+  cancel-in-progress: false
+
+jobs:
+  test-commit:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: signed-commit-lab
+      TARGET_FILE: lab/counter.txt
+
+    steps:
+      - name: Checkout protected test branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 1
+
+      - name: Generate unique test value
+        id: test-value
+        shell: bash
+        run: |
+          value="${{ inputs.method }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '%s\n' "$value" > "$TARGET_FILE"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm unsigned local commit is rejected
+        if: inputs.method == 'unsigned-local-git'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$TARGET_FILE"
+          git commit -m "test: unsigned local commit"
+
+          set +e
+          git push origin "HEAD:$TARGET_BRANCH" 2>&1 | tee /tmp/unsigned-push.log
+          push_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$push_status" -eq 0 ]; then
+            echo "GitHub unexpectedly accepted the unsigned commit."
+            exit 1
+          fi
+
+          if ! grep -Eiq 'GH013|verified signatures|signed commits' /tmp/unsigned-push.log; then
+            echo "The push failed, but not because of the signature rule."
+            exit 1
+          fi
+
+          echo "Expected result confirmed: GitHub rejected the unsigned commit."
+
+      - name: Create GitHub-signed commit through GraphQL
+        if: inputs.method == 'github-signed-graphql'
+        uses: actions/github-script@v9
+        env:
+          TEST_VALUE: ${{ steps.test-value.outputs.value }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs')
+
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const branch = process.env.TARGET_BRANCH
+            const path = process.env.TARGET_FILE
+
+            const currentRef = await github.rest.git.getRef({
+              owner,
+              repo,
+              ref: `heads/${branch}`,
+            })
+
+            const result = await github.graphql(`
+              mutation($input: CreateCommitOnBranchInput!) {
+                createCommitOnBranch(input: $input) {
+                  commit {
+                    oid
+                    url
+                  }
+                }
+              }
+            `, {
+              input: {
+                branch: {
+                  repositoryNameWithOwner: `${owner}/${repo}`,
+                  branchName: branch,
+                },
+                expectedHeadOid: currentRef.data.object.sha,
+                message: {
+                  headline: 'test: GitHub-signed GraphQL commit',
+                },
+                fileChanges: {
+                  additions: [{
+                    path,
+                    contents: fs.readFileSync(path).toString('base64'),
+                  }],
+                },
+              },
+            })
+
+            const createdCommit = result.createCommitOnBranch.commit
+            const commitDetails = await github.rest.repos.getCommit({
+              owner,
+              repo,
+              ref: createdCommit.oid,
+            })
+            const verification = commitDetails.data.commit.verification
+
+            if (!verification?.verified) {
+              core.setFailed(
+                `Commit ${createdCommit.oid} was accepted but is not verified: ${verification?.reason}`,
+              )
+              return
+            }
+
+            await core.summary
+              .addHeading('Verified commit lab result')
+              .addTable([
+                [{ data: 'Field', header: true }, { data: 'Value', header: true }],
+                ['Method', '${{ inputs.method }}'],
+                ['Commit', createdCommit.oid],
+                ['Verification', verification.reason],
+                ['Test value', process.env.TEST_VALUE],
+              ])
+              .addLink('Open verified commit', createdCommit.url)
+              .write()
+
+            core.info(`Verified commit created: ${createdCommit.url}`)
